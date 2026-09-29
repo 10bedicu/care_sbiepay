@@ -13,7 +13,7 @@ from care.emr.resources.payment_reconciliation.spec import (
     PaymentReconciliationTypeOptions,
 )
 from care.utils.time_util import care_now
-from care_sbiepay.models import SbiEpayPayment
+from care_sbiepay.models import SbiEpayMerchant, SbiEpayPayment
 from care_sbiepay.settings import plugin_settings as settings
 from care_sbiepay.utils import client
 
@@ -40,10 +40,30 @@ def other_details(invoice) -> str:
     return re.sub(r"[^A-Za-z0-9]", "", invoice.patient.name or "")[:100] or "CARE"
 
 
+def get_merchant(facility) -> SbiEpayMerchant | None:
+    """Merchant configured for a facility, regardless of whether it is enabled.
+
+    Used to reconcile payments that were already created.
+    """
+    return SbiEpayMerchant.objects.filter(facility=facility).first()
+
+
+def merchant_for(facility) -> SbiEpayMerchant:
+    """Merchant to use for new payments; must be configured and enabled."""
+    merchant = get_merchant(facility)
+    if not merchant:
+        raise client.SbiEpayError("SBI ePay merchant not configured for facility")
+    if not merchant.is_enabled:
+        raise client.SbiEpayError("SBI ePay payments are disabled for facility")
+    return merchant
+
+
 def create_payment(invoice) -> SbiEpayPayment:
     """Generate an SBI ePay payment link for an invoice and persist it."""
+    merchant = merchant_for(invoice.facility)
     merch_order_no = client.merch_order_number()
     result = client.create_payment_link(
+        merchant,
         merch_order_no=merch_order_no,
         amount=invoice.total_gross,
         other_details=other_details(invoice),
@@ -119,6 +139,35 @@ def apply_gateway_status(
         )
 
 
+def decode_push(data) -> dict | None:
+    """Decrypt a raw webhook payload using the merchant it was pushed for.
+
+    SBI sends ``merchIdVal`` alongside ``pushRespData``; when it is missing every
+    configured merchant key is tried until the checksum validates.
+    """
+    push_resp_data = data.get("pushRespData")
+    if not push_resp_data:
+        return None
+
+    merchants = SbiEpayMerchant.objects.all()
+    merchant_code = data.get("merchIdVal")
+    if merchant_code:
+        merchants = merchants.filter(merchant_code=merchant_code)
+
+    for merchant in merchants:
+        try:
+            return client.parse_push_response(merchant.merchant_key, push_resp_data)
+        except Exception:
+            logger.debug(
+                "SBI ePay push did not decode with merchant %s",
+                merchant.merchant_code,
+            )
+    logger.warning(
+        "No SBI ePay merchant could decode push (merchIdVal=%s)", merchant_code
+    )
+    return None
+
+
 def reconcile_push(push: dict) -> bool:
     """Reconcile a standalone payment from a decoded push payload.
 
@@ -148,8 +197,16 @@ def poll_pending_payments() -> None:
         if payment.created_date and payment.created_date < cutoff:
             _mark(payment, SbiEpayPayment.Status.EXPIRED)
             continue
+        merchant = get_merchant(payment.invoice.facility)
+        if not merchant:
+            logger.warning(
+                "No SBI ePay merchant for facility of order %s; skipping poll",
+                payment.order_number,
+            )
+            continue
         try:
             result = client.status_query(
+                merchant,
                 merch_order_no=payment.order_number,
                 amount=payment.amount,
             )

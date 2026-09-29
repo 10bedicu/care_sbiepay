@@ -40,8 +40,6 @@ Settings are read from `PLUGIN_CONFIGS["care_sbiepay"]` or the environment:
 | `SBI_EPAY_BASE_URL` | SBI ePay API base URL | `https://epay.sbiuat.bank.in` |
 | `SBI_EPAY_API_KEY_ID` | Merchant API key id | |
 | `SBI_EPAY_API_SECRET_KEY` | Merchant API secret key | |
-| `SBI_EPAY_MERCHANT_CODE` | Merchant code | |
-| `SBI_EPAY_MERCHANT_KEY` | Merchant encryption key (AES) | |
 | `SBI_EPAY_SOURCE_URL` | Merchant's SBI-registered source URL | |
 | `SBI_EPAY_REQUEST_TIMEOUT` | HTTP request timeout in seconds | `30` |
 | `SBI_EPAY_PAID_RESPONSE_STATUSES` | Gateway statuses treated as paid | `SUCCESS` |
@@ -53,6 +51,24 @@ Settings are read from `PLUGIN_CONFIGS["care_sbiepay"]` or the environment:
 
 For ABDM scan-and-pay, also set `ABDM_SCAN_AND_PAY_PROVIDER=sbi_epay` in the ABDM
 plug config.
+
+### Per-facility merchant
+
+The merchant code and merchant (AES) key are configured per facility, not via
+environment. A facility without an enabled merchant cannot generate payment
+links. Reads are open to authenticated users; writes require a superuser. The
+key is write-only and returned masked as `merchant_key_masked`.
+
+```
+POST  /api/care_sbiepay/merchant/
+{ "facility_id": "<facility external_id>", "merchant_code": "...", "merchant_key": "...", "is_enabled": true }
+
+GET   /api/care_sbiepay/merchant/<facility external_id>/
+PATCH /api/care_sbiepay/merchant/<facility external_id>/
+```
+
+The [`care_sbiepay_fe`](../../care_sbiepay_fe) frontend plug adds a
+"Configure SBI ePay merchant" action to the facility home page for this.
 
 ## Payment link API
 
@@ -72,7 +88,8 @@ A standalone payment moves through these states:
 `created → paid | failed | cancelled | expired`
 
 - **Webhook** — SBI ePay push notifications are posted to
-  `POST /api/care_sbiepay/webhook/`. Standalone orders settle their invoice;
+  `POST /api/care_sbiepay/webhook/`. The push is decrypted with the key of the
+  merchant identified by `merchIdVal`. Standalone orders settle their invoice;
   unknown orders fall through to ABDM scan-and-pay (when installed).
 - **Polling** — when `SBI_EPAY_POLLING_ENABLED` is on, a Celery task queries the
   gateway every `SBI_EPAY_POLLING_INTERVAL` seconds for each pending payment,

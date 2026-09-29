@@ -7,7 +7,6 @@ from rest_framework.response import Response
 from rest_framework.viewsets import GenericViewSet
 
 from care_sbiepay import payments
-from care_sbiepay.utils import client
 
 logger = logging.getLogger(__name__)
 
@@ -30,13 +29,11 @@ class WebhookViewSet(GenericViewSet):
     def create(self, request):
         logger.info("SBI ePay webhook received")
 
-        push_resp_data = request.data.get("pushRespData")
-        if push_resp_data:
-            try:
-                push = client.parse_push_response(push_resp_data)
-                if not payments.reconcile_push(push):
-                    _reconcile_via_abdm(push)
-            except Exception:
-                logger.exception("Failed to process SBI ePay push response")
+        try:
+            push = payments.decode_push(request.data)
+            if push and not payments.reconcile_push(push):
+                _reconcile_via_abdm(push)
+        except Exception:
+            logger.exception("Failed to process SBI ePay push response")
 
         return Response(status=status.HTTP_200_OK)

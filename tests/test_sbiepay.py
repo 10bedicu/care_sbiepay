@@ -17,15 +17,16 @@ from care.utils.tests.base import CareAPITestBase
 from care.utils.time_util import care_now
 from care_sbiepay import payments
 from care_sbiepay import provider as sbiepay_provider
-from care_sbiepay.models import SbiEpayPayment
+from care_sbiepay.models import SbiEpayMerchant, SbiEpayPayment
 from care_sbiepay.settings import plugin_settings as settings
+
+MERCHANT_KEY = "/IIvvWMcy5ls/V2hCNZ5/Q=="
 
 
 class TestSbiEpayCrypto(SimpleTestCase):
     def test_encrypt_decrypt_roundtrip(self):
-        key = "/IIvvWMcy5ls/V2hCNZ5/Q=="
-        enc = crypto.encrypt(key, "hello world")
-        self.assertEqual(crypto.decrypt(key, enc), "hello world")
+        enc = crypto.encrypt(MERCHANT_KEY, "hello world")
+        self.assertEqual(crypto.decrypt(MERCHANT_KEY, enc), "hello world")
 
 
 class SbiEpayTestBase(CareAPITestBase):
@@ -46,6 +47,11 @@ class SbiEpayTestBase(CareAPITestBase):
         )
         self.account = baker.make(
             "emr.Account", facility=self.facility, patient=self.patient
+        )
+        self.merchant = SbiEpayMerchant.objects.create(
+            facility=self.facility,
+            merchant_code="1000755",
+            merchant_key=MERCHANT_KEY,
         )
 
     def make_invoice(self, number="INV-SBI"):
@@ -94,6 +100,13 @@ class TestSbiEpayProvider(SbiEpayTestBase):
         self.assertEqual(
             mock_create.call_args.kwargs["merch_order_no"], result["order_number"]
         )
+        self.assertEqual(mock_create.call_args.args[0], self.merchant)
+
+    def test_create_payment_link_requires_merchant(self):
+        self.merchant.delete()
+
+        with self.assertRaises(sbiepay_provider.client.SbiEpayError):
+            sbiepay_provider.SbiEpayProvider().create_payment_link(self.make_invoice())
 
 
 class TestSbiEpayReconcile(SbiEpayTestBase):
@@ -117,6 +130,7 @@ class TestSbiEpayReconcile(SbiEpayTestBase):
             ).exists()
         )
         mock_task.assert_called_once()
+        self.assertEqual(mock_status.call_args.args[0], self.merchant)
 
     @patch("abdm.signals.scan_pay.scan_pay_notify.delay")
     @patch("care_sbiepay.provider.client.status_query")
@@ -189,6 +203,20 @@ class TestSbiEpayStandalonePayment(SbiEpayTestBase):
         self.assertEqual(
             mock_create.call_args.kwargs["merch_order_no"], payment.order_number
         )
+        self.assertEqual(mock_create.call_args.args[0], self.merchant)
+
+    def test_create_payment_requires_merchant(self):
+        self.merchant.delete()
+
+        with self.assertRaises(payments.client.SbiEpayError):
+            payments.create_payment(self.make_invoice())
+
+    def test_create_payment_rejects_disabled_merchant(self):
+        self.merchant.is_enabled = False
+        self.merchant.save()
+
+        with self.assertRaises(payments.client.SbiEpayError):
+            payments.create_payment(self.make_invoice())
 
     @patch("care_sbiepay.payments.rebalance_account_task.delay")
     def test_push_reconciles_standalone_payment(self, mock_rebalance):
@@ -297,3 +325,145 @@ class TestSbiEpayStandalonePayment(SbiEpayTestBase):
         payment.refresh_from_db()
         self.assertEqual(payment.status, SbiEpayPayment.Status.EXPIRED)
         mock_status.assert_not_called()
+
+
+def make_push(fields, key=MERCHANT_KEY) -> str:
+    # SBI push: pipe-delimited body, trailing SHA-512 of everything up to the last pipe.
+    body = "|".join(fields) + "|"
+    return crypto.encrypt(key, body + crypto.checksum(body))
+
+
+class TestSbiEpayDecodePush(SbiEpayTestBase):
+    fields = ["order123", "ATRN1", "SUCCESS", "100.00", "INR", "UPI", "CARE"]
+
+    def test_decodes_with_merchant_from_merch_id_val(self):
+        push = payments.decode_push(
+            {"pushRespData": make_push(self.fields), "merchIdVal": "1000755"}
+        )
+
+        self.assertEqual(push["merch_order_no"], "order123")
+        self.assertEqual(push["status"], "SUCCESS")
+        self.assertEqual(push["atrn"], "ATRN1")
+
+    def test_falls_back_to_trying_all_merchants(self):
+        other_facility = self.create_facility(self.user)
+        SbiEpayMerchant.objects.create(
+            facility=other_facility,
+            merchant_code="2000000",
+            merchant_key="AAAAAAAAAAAAAAAAAAAAAA==",
+        )
+
+        push = payments.decode_push({"pushRespData": make_push(self.fields)})
+
+        self.assertEqual(push["merch_order_no"], "order123")
+
+    def test_returns_none_for_unknown_merchant(self):
+        self.assertIsNone(
+            payments.decode_push(
+                {"pushRespData": make_push(self.fields), "merchIdVal": "unknown"}
+            )
+        )
+
+    def test_returns_none_without_payload(self):
+        self.assertIsNone(payments.decode_push({"merchIdVal": "1000755"}))
+
+
+class TestSbiEpayMerchantAPI(CareAPITestBase):
+    def setUp(self):
+        self.superuser = self.create_super_user()
+        self.facility = self.create_facility(self.superuser)
+        self.url = "/api/care_sbiepay/merchant/"
+
+    def detail_url(self, facility):
+        return f"{self.url}{facility.external_id}/"
+
+    def test_superuser_can_create_merchant(self):
+        self.client.force_authenticate(user=self.superuser)
+
+        response = self.client.post(
+            self.url,
+            {
+                "facility_id": str(self.facility.external_id),
+                "merchant_code": "1000755",
+                "merchant_key": MERCHANT_KEY,
+                "is_enabled": True,
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 201, response.data)
+        self.assertEqual(response.data["merchant_code"], "1000755")
+        self.assertEqual(response.data["facility_id"], self.facility.external_id)
+        self.assertNotIn("merchant_key", response.data)
+        self.assertTrue(response.data["merchant_key_masked"].endswith("/Q=="))
+        self.assertTrue(response.data["merchant_key_masked"].startswith("****"))
+        merchant = SbiEpayMerchant.objects.get(facility=self.facility)
+        self.assertEqual(merchant.merchant_key, MERCHANT_KEY)
+
+    def test_non_superuser_cannot_write_but_can_read(self):
+        user = self.create_user()
+        org = self.create_facility_organization(self.facility)
+        baker.make("emr.FacilityOrganizationUser", organization=org, user=user)
+        SbiEpayMerchant.objects.create(
+            facility=self.facility, merchant_code="1000755", merchant_key=MERCHANT_KEY
+        )
+        self.client.force_authenticate(user=user)
+
+        response = self.client.post(
+            self.url,
+            {
+                "facility_id": str(self.facility.external_id),
+                "merchant_code": "x",
+                "merchant_key": "y",
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, 403)
+
+        response = self.client.get(self.detail_url(self.facility))
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["merchant_code"], "1000755")
+
+    def test_user_without_facility_access_gets_404(self):
+        user = self.create_user()
+        SbiEpayMerchant.objects.create(
+            facility=self.facility, merchant_code="1000755", merchant_key=MERCHANT_KEY
+        )
+        self.client.force_authenticate(user=user)
+
+        response = self.client.get(self.detail_url(self.facility))
+
+        self.assertEqual(response.status_code, 404)
+
+    def test_patch_updates_key_and_toggle(self):
+        merchant = SbiEpayMerchant.objects.create(
+            facility=self.facility, merchant_code="1000755", merchant_key=MERCHANT_KEY
+        )
+        self.client.force_authenticate(user=self.superuser)
+
+        response = self.client.patch(
+            self.detail_url(self.facility),
+            {"merchant_key": "newkey1234567890", "is_enabled": False},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 200, response.data)
+        merchant.refresh_from_db()
+        self.assertEqual(merchant.merchant_key, "newkey1234567890")
+        self.assertFalse(merchant.is_enabled)
+        self.assertEqual(response.data["merchant_key_masked"], "************7890")
+
+    def test_patch_cannot_move_merchant_to_another_facility(self):
+        SbiEpayMerchant.objects.create(
+            facility=self.facility, merchant_code="1000755", merchant_key=MERCHANT_KEY
+        )
+        other = self.create_facility(self.superuser)
+        self.client.force_authenticate(user=self.superuser)
+
+        response = self.client.patch(
+            self.detail_url(self.facility),
+            {"facility_id": str(other.external_id)},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 400)

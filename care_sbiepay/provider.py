@@ -8,7 +8,12 @@ from abdm.service.v3.payment_providers import (
     register_provider,
 )
 
-from care_sbiepay.payments import other_details, paid_statuses
+from care_sbiepay.payments import (
+    get_merchant,
+    merchant_for,
+    other_details,
+    paid_statuses,
+)
 from care_sbiepay.utils import client
 
 logger = logging.getLogger(__name__)
@@ -29,8 +34,10 @@ class SbiEpayProvider(PaymentProvider):
     name = "sbi_epay"
 
     def create_payment_link(self, invoice) -> dict:
+        merchant = merchant_for(invoice.facility)
         merch_order_no = client.merch_order_number()
         result = client.create_payment_link(
+            merchant,
             merch_order_no=merch_order_no,
             amount=invoice.total_gross,
             other_details=other_details(invoice),
@@ -47,7 +54,14 @@ class SbiEpayProvider(PaymentProvider):
     def reconcile_order(self, order) -> None:
         if not order.invoice_id or order.status in PAYMENT_ORDER_PAID_STATUSES:
             return
+        merchant = get_merchant(order.invoice.facility)
+        if not merchant:
+            logger.warning(
+                "No SBI ePay merchant for facility of order %s", order.order_number
+            )
+            return
         result = client.status_query(
+            merchant,
             merch_order_no=order.order_number,
             amount=order.invoice.total_gross,
         )

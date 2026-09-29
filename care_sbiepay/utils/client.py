@@ -27,14 +27,6 @@ class SbiEpayError(Exception):
     pass
 
 
-def encrypt(plain: str) -> str:
-    return crypto.encrypt(settings.SBI_EPAY_MERCHANT_KEY, plain)
-
-
-def decrypt(enc: str) -> str:
-    return crypto.decrypt(settings.SBI_EPAY_MERCHANT_KEY, enc)
-
-
 def checksum(plain: str) -> str:
     return crypto.checksum(plain)
 
@@ -76,12 +68,12 @@ def get_token(force_refresh: bool = False) -> str:
     return token
 
 
-def _post_encrypted(path: str, req: dict) -> dict:
+def _post_encrypted(merchant, path: str, req: dict) -> dict:
     plain = json.dumps({"req": req}, separators=(",", ":"))
     body = {
-        "encData": encrypt(plain),
+        "encData": crypto.encrypt(merchant.merchant_key, plain),
         "cs": checksum(plain),
-        "merchantCode": settings.SBI_EPAY_MERCHANT_CODE,
+        "merchantCode": merchant.merchant_code,
     }
 
     def _call(token):
@@ -106,14 +98,17 @@ def _post_encrypted(path: str, req: dict) -> dict:
     if not enc or enc == "ERROR":
         raise SbiEpayError(payload.get("cs") or "SBI ePay request failed")
 
-    decrypted = json.loads(decrypt(enc))
+    decrypted = json.loads(crypto.decrypt(merchant.merchant_key, enc))
     return decrypted.get("res") or decrypted
 
 
-def create_payment_link(*, merch_order_no: str, amount, other_details: str) -> dict:
+def create_payment_link(
+    merchant, *, merch_order_no: str, amount, other_details: str
+) -> dict:
     now = datetime.now(IST)
     validity = now.replace(hour=23, minute=59, second=59, microsecond=0)
     return _post_encrypted(
+        merchant,
         GENERATE_PAYMENT_URL_PATH,
         {
             "merchOrderNo": merch_order_no,
@@ -126,12 +121,13 @@ def create_payment_link(*, merch_order_no: str, amount, other_details: str) -> d
     )
 
 
-def status_query(*, merch_order_no: str, amount, atrn: str = "") -> dict:
+def status_query(merchant, *, merch_order_no: str, amount, atrn: str = "") -> dict:
     return _post_encrypted(
+        merchant,
         STATUS_QUERY_PATH,
         {
             "atrn": atrn,
-            "merchantId": settings.SBI_EPAY_MERCHANT_CODE,
+            "merchantId": merchant.merchant_code,
             "merchOrderNo": merch_order_no,
             "amount": format_amount(amount),
             "sourceUrl": _source_url(),
@@ -158,8 +154,8 @@ PUSH_FIELDS = (
 )
 
 
-def parse_push_response(push_resp_data: str) -> dict:
-    plain = decrypt(push_resp_data)
+def parse_push_response(merchant_key: str, push_resp_data: str) -> dict:
+    plain = crypto.decrypt(merchant_key, push_resp_data)
     idx = plain.rfind("|")
     if idx == -1:
         raise SbiEpayError("Malformed SBI ePay push payload")
