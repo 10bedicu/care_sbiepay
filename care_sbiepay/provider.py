@@ -1,14 +1,18 @@
 import logging
 
-from abdm.models.payment_order import PAYMENT_ORDER_PAID_STATUSES
+from abdm.models.payment_order import PAYMENT_ORDER_PAID_STATUSES, PaymentOrderStatus
 from abdm.service.v3.payment_providers import (
     PaymentProvider,
+    close_payment_order,
     create_payment_reconciliation,
     reconcile_payment_order,
     register_provider,
 )
 
 from care_sbiepay.payments import (
+    cancelled_statuses,
+    expired_statuses,
+    failed_statuses,
     get_merchant,
     merchant_for,
     other_details,
@@ -66,12 +70,16 @@ class SbiEpayProvider(PaymentProvider):
             amount=order.invoice.total_gross,
         )
         status = (result.get("Response Status") or "").upper()
-        if status not in paid_statuses():
+        if status in paid_statuses():
+            reference = result.get("SBIePayRefID/ATRN") or result.get(
+                "Bank Reference Number"
+            )
+            create_payment_reconciliation(order, reference)
+        elif status in cancelled_statuses():
+            close_payment_order(order, PaymentOrderStatus.CANCELED)
+        elif status in failed_statuses() or status in expired_statuses():
+            close_payment_order(order, PaymentOrderStatus.FAIL)
+        else:
             logger.info(
                 "SBI ePay order %s not paid, status %s", order.order_number, status
             )
-            return
-        reference = result.get("SBIePayRefID/ATRN") or result.get(
-            "Bank Reference Number"
-        )
-        create_payment_reconciliation(order, reference)

@@ -1,7 +1,7 @@
 import json
 import logging
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal
 from zoneinfo import ZoneInfo
 
@@ -42,6 +42,12 @@ def merch_order_number() -> str:
 
 def _source_url() -> str:
     return settings.SBI_EPAY_SOURCE_URL
+
+
+def order_validity() -> datetime:
+    now = datetime.now(IST)
+    end_of_day = now.replace(hour=23, minute=59, second=59, microsecond=0)
+    return min(now + timedelta(seconds=settings.SBI_EPAY_PAYMENT_MAX_AGE), end_of_day)
 
 
 def get_token(force_refresh: bool = False) -> str:
@@ -103,10 +109,15 @@ def _post_encrypted(merchant, path: str, req: dict) -> dict:
 
 
 def create_payment_link(
-    merchant, *, merch_order_no: str, amount, other_details: str
+    merchant,
+    *,
+    merch_order_no: str,
+    amount,
+    other_details: str,
+    validity: datetime | None = None,
 ) -> dict:
     now = datetime.now(IST)
-    validity = now.replace(hour=23, minute=59, second=59, microsecond=0)
+    validity = validity or order_validity()
     return _post_encrypted(
         merchant,
         GENERATE_PAYMENT_URL_PATH,
@@ -114,7 +125,9 @@ def create_payment_link(
             "merchOrderNo": merch_order_no,
             "amount": format_amount(amount),
             "transactionDate": now.strftime("%d/%m/%Y %H:%M:%S"),
-            "merchOrderNoValidity": validity.strftime("%d/%m/%Y %H:%M:%S"),
+            "merchOrderNoValidity": validity.astimezone(IST).strftime(
+                "%d/%m/%Y %H:%M:%S"
+            ),
             "sourceUrl": _source_url(),
             "otherDetails": other_details,
         },

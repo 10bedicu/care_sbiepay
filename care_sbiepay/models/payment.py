@@ -24,3 +24,4 @@ class SbiEpayPayment(BaseModel):
     )
     reference = models.CharField(max_length=255, blank=True, default="")
     payment_url = models.TextField(blank=True, default="")
+    expires_at = models.DateTimeField(null=True, blank=True, db_index=True)

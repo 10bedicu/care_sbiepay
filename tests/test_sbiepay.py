@@ -1,4 +1,4 @@
-from datetime import timedelta
+from datetime import datetime, timedelta
 from decimal import Decimal
 from unittest.mock import patch
 
@@ -6,7 +6,7 @@ from abdm.models import AbhaNumber, HealthFacility, PaymentOrder
 from abdm.models.payment_order import PaymentOrderStatus
 from abdm.service.helper import uuid
 from abdm.utils import user as abdm_user
-from care_sbiepay.utils import crypto
+from care_sbiepay.utils import client, crypto
 from django.test import SimpleTestCase
 from model_bakery import baker
 
@@ -27,6 +27,39 @@ class TestSbiEpayCrypto(SimpleTestCase):
     def test_encrypt_decrypt_roundtrip(self):
         enc = crypto.encrypt(MERCHANT_KEY, "hello world")
         self.assertEqual(crypto.decrypt(MERCHANT_KEY, enc), "hello world")
+
+
+class TestSbiEpayClient(SimpleTestCase):
+    def test_order_validity_uses_max_age(self):
+        with patch.object(client.settings, "SBI_EPAY_PAYMENT_MAX_AGE", 60):
+            validity = client.order_validity()
+
+        expected = datetime.now(client.IST) + timedelta(seconds=60)
+        self.assertAlmostEqual(validity, expected, delta=timedelta(seconds=5))
+
+    def test_order_validity_is_capped_at_end_of_ist_day(self):
+        with patch.object(client.settings, "SBI_EPAY_PAYMENT_MAX_AGE", 10 * 86400):
+            validity = client.order_validity()
+
+        now = datetime.now(client.IST)
+        self.assertEqual(validity.date(), now.date())
+        self.assertEqual((validity.hour, validity.minute, validity.second), (23, 59, 59))
+
+    @patch("care_sbiepay.utils.client._post_encrypted")
+    def test_create_payment_link_sends_validity_in_ist(self, mock_post):
+        validity = datetime(2030, 1, 15, 10, 30, tzinfo=client.IST)
+
+        client.create_payment_link(
+            object(),
+            merch_order_no="abc123",
+            amount=Decimal(100),
+            other_details="CARE",
+            validity=validity,
+        )
+
+        req = mock_post.call_args.args[2]
+        self.assertEqual(req["merchOrderNoValidity"], "15/01/2030 10:30:00")
+        self.assertEqual(req["amount"], "100.00")
 
 
 class SbiEpayTestBase(CareAPITestBase):
@@ -73,6 +106,15 @@ class SbiEpayTestBase(CareAPITestBase):
             invoice=self.make_invoice("INV-SBI-REC"),
             order_number="sbiorder123",
             status=PaymentOrderStatus.PAYMENT_INITIATED,
+        )
+
+    def make_payment(self, order_number, number="INV-PAY", **fields):
+        invoice = self.make_invoice(number)
+        return SbiEpayPayment.objects.create(
+            order_number=order_number,
+            invoice=invoice,
+            amount=invoice.total_gross,
+            **fields,
         )
 
 
@@ -150,6 +192,43 @@ class TestSbiEpayReconcile(SbiEpayTestBase):
         mock_task.assert_not_called()
 
     @patch("abdm.signals.scan_pay.scan_pay_notify.delay")
+    @patch("care_sbiepay.provider.client.status_query")
+    def test_reconcile_fails_failed_order(self, mock_status, mock_task):
+        mock_status.return_value = {"Response Status": "FAILURE"}
+        order = self.make_order()
+
+        sbiepay_provider.SbiEpayProvider().reconcile_order(order)
+
+        order.refresh_from_db()
+        self.assertEqual(order.status, PaymentOrderStatus.FAIL)
+        self.assertFalse(
+            PaymentReconciliation.objects.filter(
+                target_invoice=order.invoice
+            ).exists()
+        )
+        mock_task.assert_not_called()
+
+    @patch("care_sbiepay.provider.client.status_query")
+    def test_reconcile_fails_expired_order(self, mock_status):
+        mock_status.return_value = {"Response Status": "EXPIRED"}
+        order = self.make_order()
+
+        sbiepay_provider.SbiEpayProvider().reconcile_order(order)
+
+        order.refresh_from_db()
+        self.assertEqual(order.status, PaymentOrderStatus.FAIL)
+
+    @patch("care_sbiepay.provider.client.status_query")
+    def test_reconcile_cancels_cancelled_order(self, mock_status):
+        mock_status.return_value = {"Response Status": "CANCELLED"}
+        order = self.make_order()
+
+        sbiepay_provider.SbiEpayProvider().reconcile_order(order)
+
+        order.refresh_from_db()
+        self.assertEqual(order.status, PaymentOrderStatus.CANCELED)
+
+    @patch("abdm.signals.scan_pay.scan_pay_notify.delay")
     def test_push_marks_paid_and_notifies(self, mock_task):
         order = self.make_order()
 
@@ -204,6 +283,11 @@ class TestSbiEpayStandalonePayment(SbiEpayTestBase):
             mock_create.call_args.kwargs["merch_order_no"], payment.order_number
         )
         self.assertEqual(mock_create.call_args.args[0], self.merchant)
+        # the validity sent to SBI is what polling stops at
+        self.assertEqual(payment.expires_at, mock_create.call_args.kwargs["validity"])
+        expected = care_now() + timedelta(seconds=settings.SBI_EPAY_PAYMENT_MAX_AGE)
+        self.assertLessEqual(payment.expires_at, expected + timedelta(seconds=5))
+        self.assertGreater(payment.expires_at, care_now())
 
     def test_create_payment_requires_merchant(self):
         self.merchant.delete()
@@ -287,6 +371,32 @@ class TestSbiEpayStandalonePayment(SbiEpayTestBase):
         )
 
     @patch("care_sbiepay.payments.rebalance_account_task.delay")
+    def test_push_settles_locally_expired_payment(self, mock_rebalance):
+        payment = self.make_payment(
+            "lateorder123", "INV-LATE", status=SbiEpayPayment.Status.EXPIRED
+        )
+
+        payments.reconcile_push(
+            {"merch_order_no": "lateorder123", "status": "SUCCESS", "atrn": "ATRN9"}
+        )
+
+        payment.refresh_from_db()
+        self.assertEqual(payment.status, SbiEpayPayment.Status.PAID)
+        self.assertEqual(payment.reference, "ATRN9")
+        self.assertTrue(
+            PaymentReconciliation.objects.filter(target_invoice=payment.invoice).exists()
+        )
+        mock_rebalance.assert_called_once()
+
+    def test_push_marks_expired_standalone_payment(self):
+        payment = self.make_payment("expiredorder1", "INV-GW-EXPIRED")
+
+        payments.reconcile_push({"merch_order_no": "expiredorder1", "status": "EXPIRED"})
+
+        payment.refresh_from_db()
+        self.assertEqual(payment.status, SbiEpayPayment.Status.EXPIRED)
+
+    @patch("care_sbiepay.payments.rebalance_account_task.delay")
     @patch("care_sbiepay.payments.client.status_query")
     def test_poll_reconciles_paid_pending_payment(self, mock_status, mock_rebalance):
         mock_status.return_value = {
@@ -310,13 +420,25 @@ class TestSbiEpayStandalonePayment(SbiEpayTestBase):
         )
 
     @patch("care_sbiepay.payments.client.status_query")
-    def test_poll_expires_stale_payment(self, mock_status):
-        invoice = self.make_invoice("INV-EXPIRE")
-        payment = SbiEpayPayment.objects.create(
-            order_number="staleorder123",
-            invoice=invoice,
-            amount=invoice.total_gross,
-        )
+    def test_poll_expires_stale_payment_after_final_check(self, mock_status):
+        mock_status.return_value = {"Response Status": "PENDING"}
+        payment = self.make_payment("staleorder123", "INV-EXPIRE")
+        stale = care_now() - timedelta(seconds=settings.SBI_EPAY_PAYMENT_MAX_AGE + 60)
+        SbiEpayPayment.objects.filter(pk=payment.pk).update(created_date=stale)
+
+        payments.poll_pending_payments()
+        payments.poll_pending_payments()
+
+        payment.refresh_from_db()
+        self.assertEqual(payment.status, SbiEpayPayment.Status.EXPIRED)
+        # one last status query, then never polled again
+        mock_status.assert_called_once()
+        self.assertEqual(mock_status.call_args.kwargs["merch_order_no"], "staleorder123")
+
+    @patch("care_sbiepay.payments.client.status_query")
+    def test_poll_expires_stale_payment_even_if_gateway_fails(self, mock_status):
+        mock_status.side_effect = client.SbiEpayError("gateway down")
+        payment = self.make_payment("downorder123", "INV-DOWN")
         stale = care_now() - timedelta(seconds=settings.SBI_EPAY_PAYMENT_MAX_AGE + 60)
         SbiEpayPayment.objects.filter(pk=payment.pk).update(created_date=stale)
 
@@ -324,7 +446,47 @@ class TestSbiEpayStandalonePayment(SbiEpayTestBase):
 
         payment.refresh_from_db()
         self.assertEqual(payment.status, SbiEpayPayment.Status.EXPIRED)
-        mock_status.assert_not_called()
+
+    @patch("care_sbiepay.payments.client.status_query")
+    def test_poll_stops_at_order_validity(self, mock_status):
+        mock_status.return_value = {"Response Status": "PENDING"}
+        # fresh row whose order validity already passed at the gateway
+        payment = self.make_payment(
+            "shortorder123", "INV-SHORT", expires_at=care_now() - timedelta(seconds=1)
+        )
+
+        payments.poll_pending_payments()
+        payments.poll_pending_payments()
+
+        payment.refresh_from_db()
+        self.assertEqual(payment.status, SbiEpayPayment.Status.EXPIRED)
+        mock_status.assert_called_once()
+
+    @patch("care_sbiepay.payments.client.status_query")
+    def test_poll_keeps_polling_until_order_validity(self, mock_status):
+        mock_status.return_value = {"Response Status": "PENDING"}
+        # old row whose order is still valid at the gateway
+        payment = self.make_payment(
+            "longorder1234", "INV-LONG", expires_at=care_now() + timedelta(hours=3)
+        )
+        stale = care_now() - timedelta(seconds=settings.SBI_EPAY_PAYMENT_MAX_AGE + 60)
+        SbiEpayPayment.objects.filter(pk=payment.pk).update(created_date=stale)
+
+        payments.poll_pending_payments()
+
+        payment.refresh_from_db()
+        self.assertEqual(payment.status, SbiEpayPayment.Status.CREATED)
+        mock_status.assert_called_once()
+
+    @patch("care_sbiepay.payments.client.status_query")
+    def test_poll_marks_gateway_expired_payment(self, mock_status):
+        mock_status.return_value = {"Response Status": "EXPIRED"}
+        payment = self.make_payment("gwexpired1234", "INV-GW-EXP")
+
+        payments.poll_pending_payments()
+
+        payment.refresh_from_db()
+        self.assertEqual(payment.status, SbiEpayPayment.Status.EXPIRED)
 
 
 def make_push(fields, key=MERCHANT_KEY) -> str:

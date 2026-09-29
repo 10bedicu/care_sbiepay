@@ -19,6 +19,8 @@ from care_sbiepay.utils import client
 
 logger = logging.getLogger(__name__)
 
+SETTLEABLE_STATUSES = {SbiEpayPayment.Status.CREATED, SbiEpayPayment.Status.EXPIRED}
+
 
 def _status_set(raw: str) -> set[str]:
     return {value.strip().upper() for value in raw.split(",") if value.strip()}
@@ -34,6 +36,20 @@ def failed_statuses() -> set[str]:
 
 def cancelled_statuses() -> set[str]:
     return _status_set(settings.SBI_EPAY_CANCELLED_RESPONSE_STATUSES)
+
+
+def expired_statuses() -> set[str]:
+    return _status_set(settings.SBI_EPAY_EXPIRED_RESPONSE_STATUSES)
+
+
+def payment_deadline(payment: SbiEpayPayment):
+    if payment.expires_at:
+        return payment.expires_at
+    if payment.created_date:
+        return payment.created_date + timedelta(
+            seconds=settings.SBI_EPAY_PAYMENT_MAX_AGE
+        )
+    return None
 
 
 def other_details(invoice) -> str:
@@ -62,11 +78,13 @@ def create_payment(invoice) -> SbiEpayPayment:
     """Generate an SBI ePay payment link for an invoice and persist it."""
     merchant = merchant_for(invoice.facility)
     merch_order_no = client.merch_order_number()
+    validity = client.order_validity()
     result = client.create_payment_link(
         merchant,
         merch_order_no=merch_order_no,
         amount=invoice.total_gross,
         other_details=other_details(invoice),
+        validity=validity,
     )
     payment_url = result.get("paymentUrl")
     if not payment_url:
@@ -76,6 +94,7 @@ def create_payment(invoice) -> SbiEpayPayment:
         invoice=invoice,
         amount=invoice.total_gross,
         payment_url=payment_url,
+        expires_at=validity,
     )
 
 
@@ -105,7 +124,7 @@ def _record_reconciliation(payment: SbiEpayPayment, reference) -> None:
 
 
 def reconcile_payment(payment: SbiEpayPayment, reference) -> None:
-    if payment.status != SbiEpayPayment.Status.CREATED:
+    if payment.status not in SETTLEABLE_STATUSES:
         return
     _record_reconciliation(payment, reference)
     payment.status = SbiEpayPayment.Status.PAID
@@ -131,6 +150,8 @@ def apply_gateway_status(
         _mark(payment, SbiEpayPayment.Status.CANCELLED)
     elif status in failed_statuses():
         _mark(payment, SbiEpayPayment.Status.FAILED)
+    elif status in expired_statuses():
+        _mark(payment, SbiEpayPayment.Status.EXPIRED)
     else:
         logger.info(
             "SBI ePay order %s still pending, status %s",
@@ -187,35 +208,36 @@ def reconcile_push(push: dict) -> bool:
     return True
 
 
+def _check_gateway(payment: SbiEpayPayment) -> None:
+    merchant = get_merchant(payment.invoice.facility)
+    if not merchant:
+        logger.warning(
+            "No SBI ePay merchant for facility of order %s; skipping poll",
+            payment.order_number,
+        )
+        return
+    try:
+        result = client.status_query(
+            merchant,
+            merch_order_no=payment.order_number,
+            amount=payment.amount,
+        )
+    except Exception:
+        logger.exception(
+            "Failed to poll SBI ePay status for order %s", payment.order_number
+        )
+        return
+    reference = result.get("SBIePayRefID/ATRN") or result.get("Bank Reference Number")
+    apply_gateway_status(payment, result.get("Response Status"), reference)
+
+
 def poll_pending_payments() -> None:
-    """Poll SBI ePay for each pending payment; expire stale ones."""
-    cutoff = care_now() - timedelta(seconds=settings.SBI_EPAY_PAYMENT_MAX_AGE)
+    now = care_now()
     pending = SbiEpayPayment.objects.filter(
         status=SbiEpayPayment.Status.CREATED
     ).select_related("invoice__account", "invoice__facility")
     for payment in pending:
-        if payment.created_date and payment.created_date < cutoff:
+        _check_gateway(payment)
+        deadline = payment_deadline(payment)
+        if deadline and deadline <= now:
             _mark(payment, SbiEpayPayment.Status.EXPIRED)
-            continue
-        merchant = get_merchant(payment.invoice.facility)
-        if not merchant:
-            logger.warning(
-                "No SBI ePay merchant for facility of order %s; skipping poll",
-                payment.order_number,
-            )
-            continue
-        try:
-            result = client.status_query(
-                merchant,
-                merch_order_no=payment.order_number,
-                amount=payment.amount,
-            )
-        except Exception:
-            logger.exception(
-                "Failed to poll SBI ePay status for order %s", payment.order_number
-            )
-            continue
-        reference = result.get("SBIePayRefID/ATRN") or result.get(
-            "Bank Reference Number"
-        )
-        apply_gateway_status(payment, result.get("Response Status"), reference)
