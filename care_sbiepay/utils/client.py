@@ -1,8 +1,9 @@
 import json
 import logging
 import uuid
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from zoneinfo import ZoneInfo
 
 import requests
@@ -25,6 +26,61 @@ IST = ZoneInfo("Asia/Kolkata")
 
 class SbiEpayError(Exception):
     pass
+
+
+@dataclass(frozen=True)
+class Confirmation:
+    """What the gateway asserts about an order, from a push or a status query."""
+
+    order_number: str
+    status: str
+    reference: str = ""
+    amount: Decimal | None = None
+    currency: str = ""
+    merchant_code: str = ""
+    raw: dict = field(default_factory=dict)
+
+
+def _decimal_or_none(value) -> Decimal | None:
+    if value in (None, ""):
+        return None
+    try:
+        return Decimal(str(value).strip())
+    except (InvalidOperation, ValueError):
+        return None
+
+
+def _first(data: dict, *keys: str) -> str:
+    for key in keys:
+        value = data.get(key)
+        if value not in (None, ""):
+            return str(value)
+    return ""
+
+
+def confirmation_from_push(push: dict) -> Confirmation:
+    return Confirmation(
+        order_number=_first(push, "merch_order_no"),
+        status=_first(push, "status").upper(),
+        reference=_first(push, "atrn", "bank_ref_number"),
+        amount=_decimal_or_none(push.get("amount")),
+        currency=_first(push, "currency").upper(),
+        merchant_code=_first(push, "merchant_id"),
+        raw=push,
+    )
+
+
+def confirmation_from_status(result: dict, order_number: str) -> Confirmation:
+    return Confirmation(
+        order_number=_first(result, "merchOrderNo", "Merchant Order No")
+        or order_number,
+        status=_first(result, "Response Status").upper(),
+        reference=_first(result, "SBIePayRefID/ATRN", "Bank Reference Number"),
+        amount=_decimal_or_none(_first(result, "Amount", "amount") or None),
+        currency=_first(result, "Currency", "currency").upper(),
+        merchant_code=_first(result, "Merchant ID", "merchantId"),
+        raw=result,
+    )
 
 
 def checksum(plain: str) -> str:
@@ -104,7 +160,11 @@ def _post_encrypted(merchant, path: str, req: dict) -> dict:
     if not enc or enc == "ERROR":
         raise SbiEpayError(payload.get("cs") or "SBI ePay request failed")
 
-    decrypted = json.loads(crypto.decrypt(merchant.merchant_key, enc))
+    plain = crypto.decrypt(merchant.merchant_key, enc)
+    cs = payload.get("cs")
+    if cs and cs.strip().lower() != checksum(plain).lower():
+        raise SbiEpayError("SBI ePay response checksum mismatch")
+    decrypted = json.loads(plain)
     return decrypted.get("res") or decrypted
 
 

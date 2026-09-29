@@ -1,6 +1,10 @@
 import logging
 
-from abdm.models.payment_order import PAYMENT_ORDER_PAID_STATUSES, PaymentOrderStatus
+from abdm.models.payment_order import (
+    PAYMENT_ORDER_PAID_STATUSES,
+    PaymentOrder,
+    PaymentOrderStatus,
+)
 from abdm.service.v3.payment_providers import (
     PaymentProvider,
     close_payment_order,
@@ -23,14 +27,21 @@ from care_sbiepay.utils import client
 logger = logging.getLogger(__name__)
 
 
-def reconcile_abdm_push(push: dict) -> None:
-    """Reconcile an ABDM scan-and-pay order from a decoded push payload."""
-    if (push.get("status") or "").upper() not in paid_statuses():
-        return
-    reconcile_payment_order(
-        push.get("merch_order_no"),
-        push.get("atrn") or push.get("bank_ref_number"),
-    )
+def reconcile_abdm_push(push: dict) -> bool:
+    """Reconcile an ABDM scan-and-pay order from a decoded push payload.
+
+    Only a paid status changes anything; a failed attempt does not close the
+    order because the link stays payable. Returns True when the order is known.
+    """
+    confirmation = client.confirmation_from_push(push)
+    if confirmation.status in paid_statuses():
+        order = reconcile_payment_order(
+            confirmation.order_number,
+            confirmation.reference,
+            amount=confirmation.amount,
+        )
+        return order is not None
+    return PaymentOrder.objects.filter(order_number=confirmation.order_number).exists()
 
 
 @register_provider
@@ -53,6 +64,7 @@ class SbiEpayProvider(PaymentProvider):
             "order_number": merch_order_no,
             "payment_link_id": payment_url,
             "payment_url": payment_url,
+            "amount": invoice.total_gross,
         }
 
     def reconcile_order(self, order) -> None:
@@ -64,17 +76,19 @@ class SbiEpayProvider(PaymentProvider):
                 "No SBI ePay merchant for facility of order %s", order.order_number
             )
             return
+        # the status query must quote the amount the order was created with
+        amount = order.amount if order.amount is not None else order.invoice.total_gross
         result = client.status_query(
             merchant,
             merch_order_no=order.order_number,
-            amount=order.invoice.total_gross,
+            amount=amount,
         )
-        status = (result.get("Response Status") or "").upper()
+        confirmation = client.confirmation_from_status(result, order.order_number)
+        status = confirmation.status
         if status in paid_statuses():
-            reference = result.get("SBIePayRefID/ATRN") or result.get(
-                "Bank Reference Number"
+            create_payment_reconciliation(
+                order, confirmation.reference, amount=confirmation.amount
             )
-            create_payment_reconciliation(order, reference)
         elif status in cancelled_statuses():
             close_payment_order(order, PaymentOrderStatus.CANCELED)
         elif status in failed_statuses() or status in expired_statuses():

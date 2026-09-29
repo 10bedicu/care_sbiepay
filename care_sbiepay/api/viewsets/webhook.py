@@ -6,19 +6,12 @@ from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
 from rest_framework.viewsets import GenericViewSet
 
-from care_sbiepay import payments
+from care_sbiepay import push_events
+from care_sbiepay.models import SbiEpayPushEvent
 
 logger = logging.getLogger(__name__)
 
-
-def _reconcile_via_abdm(push: dict) -> None:
-    # Optional: only wired when the ABDM plug is installed.
-    try:
-        from care_sbiepay.provider import reconcile_abdm_push
-    except ImportError:
-        logger.info("care_abdm not installed; ignoring unknown SBI ePay order")
-        return
-    reconcile_abdm_push(push)
+HANDLED = (SbiEpayPushEvent.Status.PROCESSED, SbiEpayPushEvent.Status.IGNORED)
 
 
 @extend_schema(tags=["SBI ePay"])
@@ -27,13 +20,29 @@ class WebhookViewSet(GenericViewSet):
     authentication_classes = []
 
     def create(self, request):
+        """Store an authenticated push, then apply it.
+
+        400: unauthenticated/malformed (not stored). 500: stored but processing
+        failed; the replay task (or a re-delivery) retries it. 200 otherwise.
+        """
         logger.info("SBI ePay webhook received")
 
         try:
-            push = payments.decode_push(request.data)
-            if push and not payments.reconcile_push(push):
-                _reconcile_via_abdm(push)
+            event, created = push_events.store_push(request.data)
+        except push_events.PushRejectedError as exc:
+            logger.warning("Rejected SBI ePay push: %s", exc)
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+        if not created and event.status in HANDLED:
+            return Response(status=status.HTTP_200_OK)
+
+        try:
+            push_events.process_push_event(event)
         except Exception:
-            logger.exception("Failed to process SBI ePay push response")
+            logger.exception("Failed to process SBI ePay push %s", event.pk)
+            return Response(
+                {"detail": "Push stored but could not be processed"},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
 
         return Response(status=status.HTTP_200_OK)

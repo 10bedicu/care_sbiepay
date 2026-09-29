@@ -1,20 +1,26 @@
-from pydantic import UUID4, BaseModel, field_validator
+from datetime import datetime
+from decimal import Decimal
 
-from care.emr.models.invoice import Invoice
+from pydantic import UUID4, BaseModel
 
 
 class CreatePaymentLinkRequest(BaseModel):
     invoice_id: UUID4
-
-    @field_validator("invoice_id")
-    @classmethod
-    def validate_invoice_id(cls, value):
-        if value and not Invoice.objects.filter(external_id=value).exists():
-            raise ValueError("Invoice not found")
-        return value
 
 
 class PaymentLink(BaseModel):
     order_number: str
     payment_url: str
     status: str
+    amount: Decimal
+    expires_at: datetime | None = None
+
+    @classmethod
+    def from_payment(cls, payment) -> "PaymentLink":
+        return cls(
+            order_number=payment.order_number,
+            payment_url=payment.payment_url,
+            status=payment.status,
+            amount=payment.amount,
+            expires_at=payment.expires_at,
+        )
