@@ -3,6 +3,7 @@ from decimal import Decimal
 from unittest.mock import MagicMock, patch
 from urllib.parse import urlencode
 
+import requests
 from abdm.models import AbhaNumber, HealthFacility, PaymentOrder
 from abdm.models.payment_order import PaymentOrderStatus
 from abdm.service.helper import uuid
@@ -22,10 +23,10 @@ from care.emr.resources.payment_reconciliation.spec import (
 from care.security.permissions.payment_reconciliation import (
     PaymentReconciliationPermissions,
 )
-from care.utils.lock import ObjectLocked
+from care.utils.lock import Lock, ObjectLocked
 from care.utils.tests.base import CareAPITestBase
 from care.utils.time_util import care_now
-from care_sbiepay import payments, push_events
+from care_sbiepay import payments, push_events, tasks
 from care_sbiepay import provider as sbiepay_provider
 from care_sbiepay.locks import SbiEpayPaymentLock
 from care_sbiepay.models import SbiEpayMerchant, SbiEpayPayment, SbiEpayPushEvent
@@ -271,7 +272,7 @@ class TestSbiEpayProvider(SbiEpayTestBase):
 
 
 class TestSbiEpayReconcile(SbiEpayTestBase):
-    @patch("abdm.signals.scan_pay.scan_pay_notify.delay")
+    @patch("abdm.tasks.scan_pay.scan_pay_notify.delay")
     @patch("care_sbiepay.provider.client.status_query")
     def test_reconcile_marks_paid_and_notifies(self, mock_status, mock_task):
         mock_status.return_value = {
@@ -291,7 +292,7 @@ class TestSbiEpayReconcile(SbiEpayTestBase):
         mock_task.assert_called_once()
         self.assertEqual(mock_status.call_args.args[0], self.merchant)
 
-    @patch("abdm.signals.scan_pay.scan_pay_notify.delay")
+    @patch("abdm.tasks.scan_pay.scan_pay_notify.delay")
     @patch("care_sbiepay.provider.client.status_query")
     def test_reconcile_uses_order_amount_not_invoice_total(self, mock_status, _task):
         mock_status.return_value = {
@@ -309,7 +310,7 @@ class TestSbiEpayReconcile(SbiEpayTestBase):
         reconciliation = PaymentReconciliation.objects.get(target_invoice=order.invoice)
         self.assertEqual(reconciliation.amount, Decimal(100))
 
-    @patch("abdm.signals.scan_pay.scan_pay_notify.delay")
+    @patch("abdm.tasks.scan_pay.scan_pay_notify.delay")
     def test_push_records_confirmed_amount_and_notes_mismatch(self, _task):
         order = self.make_order()
 
@@ -324,7 +325,7 @@ class TestSbiEpayReconcile(SbiEpayTestBase):
         # short-paid: ABDM keeps the order pending rather than claiming success
         self.assertEqual(order.status, PaymentOrderStatus.PENDING)
 
-    @patch("abdm.signals.scan_pay.scan_pay_notify.delay")
+    @patch("abdm.tasks.scan_pay.scan_pay_notify.delay")
     @patch("care_sbiepay.provider.client.status_query")
     def test_reconcile_is_idempotent(self, mock_status, mock_task):
         mock_status.return_value = {
@@ -345,7 +346,7 @@ class TestSbiEpayReconcile(SbiEpayTestBase):
             1,
         )
 
-    @patch("abdm.signals.scan_pay.scan_pay_notify.delay")
+    @patch("abdm.tasks.scan_pay.scan_pay_notify.delay")
     @patch("care_sbiepay.provider.client.status_query")
     def test_reconcile_ignores_unpaid(self, mock_status, mock_task):
         mock_status.return_value = {"Response Status": "NA"}
@@ -360,13 +361,14 @@ class TestSbiEpayReconcile(SbiEpayTestBase):
         )
         mock_task.assert_not_called()
 
-    @patch("abdm.signals.scan_pay.scan_pay_notify.delay")
+    @patch("abdm.tasks.scan_pay.scan_pay_notify.delay")
     @patch("care_sbiepay.provider.client.status_query")
     def test_reconcile_fails_failed_order(self, mock_status, mock_task):
         mock_status.return_value = {"Response Status": "FAILURE"}
         order = self.make_order()
 
-        sbiepay_provider.SbiEpayProvider().reconcile_order(order)
+        with self.captureOnCommitCallbacks(execute=True):
+            sbiepay_provider.SbiEpayProvider().reconcile_order(order)
 
         order.refresh_from_db()
         self.assertEqual(order.status, PaymentOrderStatus.FAIL)
@@ -376,7 +378,9 @@ class TestSbiEpayReconcile(SbiEpayTestBase):
         self.assertFalse(
             PaymentReconciliation.objects.filter(target_invoice=order.invoice).exists()
         )
-        mock_task.assert_not_called()
+        # the PHR is told the payment failed
+        payload = mock_task.call_args.args[0]
+        self.assertEqual(payload["acknowledgement"]["status"], "FAIL")
 
     @patch("care_sbiepay.provider.client.status_query")
     def test_reconcile_fails_expired_order(self, mock_status):
@@ -398,7 +402,7 @@ class TestSbiEpayReconcile(SbiEpayTestBase):
         order.refresh_from_db()
         self.assertEqual(order.status, PaymentOrderStatus.CANCELED)
 
-    @patch("abdm.signals.scan_pay.scan_pay_notify.delay")
+    @patch("abdm.tasks.scan_pay.scan_pay_notify.delay")
     def test_push_marks_paid_and_notifies(self, mock_task):
         order = self.make_order()
 
@@ -421,7 +425,7 @@ class TestSbiEpayReconcile(SbiEpayTestBase):
         )
         mock_task.assert_called_once()
 
-    @patch("abdm.signals.scan_pay.scan_pay_notify.delay")
+    @patch("abdm.tasks.scan_pay.scan_pay_notify.delay")
     def test_push_ignores_unpaid(self, mock_task):
         order = self.make_order()
 
@@ -439,7 +443,7 @@ class TestSbiEpayReconcile(SbiEpayTestBase):
             sbiepay_provider.reconcile_abdm_push(self.success_push("nosuchorder"))
         )
 
-    @patch("abdm.signals.scan_pay.scan_pay_notify.delay")
+    @patch("abdm.tasks.scan_pay.scan_pay_notify.delay")
     @patch("care_sbiepay.provider.client.status_query")
     def test_late_success_after_order_failed_is_still_recorded(
         self, mock_status, mock_task
@@ -882,6 +886,28 @@ class TestSbiEpayStandalonePayment(SbiEpayTestBase):
 
         payment.refresh_from_db()
         self.assertEqual(payment.status, SbiEpayPayment.Status.CREATED)
+
+    @patch("care_sbiepay.payments.client.status_query")
+    def test_poll_logs_unreachable_gateway_without_a_traceback(self, mock_status):
+        mock_status.side_effect = requests.Timeout("read timed out")
+        payment = self.make_payment("slowgateway12", "INV-SLOW")
+
+        with self.assertLogs("care_sbiepay.payments", level="WARNING") as logs:
+            payments.poll_pending_payments()
+
+        payment.refresh_from_db()
+        self.assertEqual(payment.status, SbiEpayPayment.Status.CREATED)
+        self.assertEqual([record.levelname for record in logs.records], ["WARNING"])
+        self.assertIsNone(logs.records[0].exc_info)
+
+    @patch("care_sbiepay.payments.client.status_query")
+    def test_poll_task_skips_tick_while_previous_run_is_going(self, mock_status):
+        self.make_payment("lockedorder12", "INV-LOCKED")
+
+        with Lock(tasks.POLL_LOCK_KEY):
+            tasks.poll_pending_payments()
+
+        mock_status.assert_not_called()
 
     @patch("care_sbiepay.payments.client.status_query")
     def test_poll_stops_at_order_validity(self, mock_status):

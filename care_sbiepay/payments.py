@@ -3,6 +3,7 @@ import re
 from datetime import timedelta
 from decimal import Decimal
 
+import requests
 from django.db import transaction
 from django.db.models import Q, Sum
 
@@ -385,6 +386,13 @@ def check_gateway(payment: SbiEpayPayment) -> bool:
             merch_order_no=payment.order_number,
             amount=payment.amount,
         )
+    except (requests.Timeout, requests.ConnectionError) as exc:
+        logger.warning(
+            "SBI ePay unreachable while polling order %s: %s",
+            payment.order_number,
+            exc,
+        )
+        return False
     except Exception:
         logger.exception(
             "Failed to poll SBI ePay status for order %s", payment.order_number

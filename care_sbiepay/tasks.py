@@ -2,17 +2,25 @@ import logging
 
 from celery import current_app, shared_task
 
+from care.utils.lock import Lock, ObjectLocked
 from care_sbiepay import payments, push_events
 from care_sbiepay.settings import plugin_settings as settings
 
 logger = logging.getLogger(__name__)
+
+POLL_LOCK_KEY = "sbiepay:poll_pending_payments"
+POLL_LOCK_TIMEOUT = 300
 
 
 @shared_task
 def poll_pending_payments() -> None:
     if not settings.SBI_EPAY_POLLING_ENABLED:
         return
-    payments.poll_pending_payments()
+    try:
+        with Lock(POLL_LOCK_KEY, POLL_LOCK_TIMEOUT):
+            payments.poll_pending_payments()
+    except ObjectLocked:
+        logger.info("Previous SBI ePay poll is still running; skipping this tick")
 
 
 @shared_task
