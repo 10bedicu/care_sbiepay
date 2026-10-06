@@ -1174,7 +1174,10 @@ class TestSbiEpayPaymentLinkAPI(SbiEpayTestBase):
         super().setUp()
         self.staff = self.create_user()
         role = self.create_role_with_permissions(
-            [PaymentReconciliationPermissions.can_write_payment_reconciliation.name]
+            [
+                PaymentReconciliationPermissions.can_write_payment_reconciliation.name,
+                PaymentReconciliationPermissions.can_read_payment_reconciliation.name,
+            ]
         )
         organization = self.create_facility_organization(self.facility)
         self.attach_role_facility_organization_user(organization, self.staff, role)
@@ -1347,6 +1350,83 @@ class TestSbiEpayPaymentLinkAPI(SbiEpayTestBase):
         response = self.client.post(f"{PAYMENT_LINK_URL}nosuchorder123/refresh/")
 
         self.assertEqual(response.status_code, 404)
+
+    @patch("care_sbiepay.payments.client.status_query")
+    def test_refresh_reports_whether_gateway_answered(self, mock_status):
+        self.make_payment("refreshgw1234", "INV-REFRESH-GW")
+        mock_status.side_effect = requests.Timeout("read timed out")
+
+        response = self.client.post(f"{PAYMENT_LINK_URL}refreshgw1234/refresh/")
+
+        self.assertEqual(response.status_code, 200, response.data)
+        self.assertFalse(response.data["gateway_checked"])
+        self.assertEqual(response.data["status"], "created")
+
+        mock_status.side_effect = None
+        mock_status.return_value = {"Response Status": "PENDING"}
+
+        response = self.client.post(f"{PAYMENT_LINK_URL}refreshgw1234/refresh/")
+
+        self.assertTrue(response.data["gateway_checked"])
+        self.assertEqual(response.data["status"], "created")
+
+    def test_lists_links_for_invoice_newest_first(self):
+        invoice = self.make_invoice("INV-LIST")
+        SbiEpayPayment.objects.create(
+            order_number="list000000001",
+            invoice=invoice,
+            amount=Decimal(100),
+            status=SbiEpayPayment.Status.SUPERSEDED,
+        )
+        SbiEpayPayment.objects.create(
+            order_number="list000000002", invoice=invoice, amount=Decimal(70)
+        )
+        self.make_payment("otherinvoice1", "INV-OTHER")
+
+        response = self.client.get(
+            PAYMENT_LINK_URL, {"invoice": str(invoice.external_id)}
+        )
+
+        self.assertEqual(response.status_code, 200, response.data)
+        self.assertEqual(response.data["count"], 2)
+        self.assertEqual(
+            [row["order_number"] for row in response.data["results"]],
+            ["list000000002", "list000000001"],
+        )
+        row = response.data["results"][0]
+        self.assertEqual(row["invoice_id"], str(invoice.external_id))
+        self.assertEqual(row["amount"], "70.00")
+        self.assertFalse(row["needs_review"])
+
+        response = self.client.get(
+            PAYMENT_LINK_URL,
+            {"invoice": str(invoice.external_id), "status": "created"},
+        )
+
+        self.assertEqual(
+            [row["order_number"] for row in response.data["results"]],
+            ["list000000002"],
+        )
+
+    def test_list_requires_invoice(self):
+        response = self.client.get(PAYMENT_LINK_URL)
+
+        self.assertEqual(response.status_code, 400)
+
+    def test_list_unknown_invoice_is_404(self):
+        response = self.client.get(PAYMENT_LINK_URL, {"invoice": str(uuid())})
+
+        self.assertEqual(response.status_code, 404)
+
+    def test_list_requires_facility_permission(self):
+        invoice = self.make_invoice("INV-LIST-403")
+        self.client.force_authenticate(user=self.create_user())
+
+        response = self.client.get(
+            PAYMENT_LINK_URL, {"invoice": str(invoice.external_id)}
+        )
+
+        self.assertEqual(response.status_code, 403)
 
 
 class TestSbiEpayMerchantAPI(CareAPITestBase):

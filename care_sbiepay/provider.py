@@ -67,15 +67,15 @@ class SbiEpayProvider(PaymentProvider):
             "amount": invoice.total_gross,
         }
 
-    def reconcile_order(self, order) -> None:
+    def reconcile_order(self, order) -> bool:
         if not order.invoice_id or order.status in PAYMENT_ORDER_PAID_STATUSES:
-            return
+            return False
         merchant = get_merchant(order.invoice.facility)
         if not merchant:
             logger.warning(
                 "No SBI ePay merchant for facility of order %s", order.order_number
             )
-            return
+            return False
         # the status query must quote the amount the order was created with
         amount = order.amount if order.amount is not None else order.invoice.total_gross
         result = client.status_query(
@@ -97,3 +97,4 @@ class SbiEpayProvider(PaymentProvider):
             logger.info(
                 "SBI ePay order %s not paid, status %s", order.order_number, status
             )
+        return True
