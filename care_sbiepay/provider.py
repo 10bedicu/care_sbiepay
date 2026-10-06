@@ -12,6 +12,7 @@ from abdm.service.v3.payment_providers import (
     reconcile_payment_order,
     register_provider,
 )
+from abdm.settings import plugin_settings as abdm_settings
 
 from care_sbiepay.payments import (
     cancelled_statuses,
@@ -56,6 +57,10 @@ class SbiEpayProvider(PaymentProvider):
             merch_order_no=merch_order_no,
             amount=invoice.total_gross,
             other_details=other_details(invoice),
+            # the link should stop being payable when ABDM gives up on the order
+            validity=client.order_validity(
+                abdm_settings.ABDM_SCAN_AND_PAY_ORDER_MAX_AGE
+            ),
         )
         payment_url = result.get("paymentUrl")
         if not payment_url:

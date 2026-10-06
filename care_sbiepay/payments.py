@@ -4,6 +4,7 @@ from datetime import timedelta
 from decimal import Decimal
 
 import requests
+from django.core.cache import cache
 from django.db import transaction
 from django.db.models import Q, Sum
 
@@ -404,8 +405,20 @@ def check_gateway(payment: SbiEpayPayment) -> bool:
     return True
 
 
+def backoff_key(payment: SbiEpayPayment) -> str:
+    return f"sbiepay:backoff:{payment.external_id}"
+
+
 def _poll(payment: SbiEpayPayment, now) -> None:
+    if cache.get(backoff_key(payment)):
+        return
     answered = check_gateway(payment)
+    if not answered:
+        cache.set(
+            backoff_key(payment),
+            1,
+            timeout=settings.SBI_EPAY_UNREACHABLE_BACKOFF,
+        )
     deadline = polling_deadline(payment)
     if not deadline or deadline > now:
         return

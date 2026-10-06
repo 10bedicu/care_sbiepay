@@ -52,6 +52,7 @@ Settings are read from `PLUGIN_CONFIGS["care_sbiepay"]` or the environment:
 | `SBI_EPAY_CURRENCY` | Currency a confirmation must report; anything else is flagged for review | `INR` |
 | `SBI_EPAY_EXPIRY_GRACE_SECONDS` | Keep polling this long after the order validity for a last-second payment | `900` |
 | `SBI_EPAY_EXPIRY_HARD_CAP_SECONDS` | If the gateway stays unreachable, expire (flagged for review) this long after the deadline | `86400` |
+| `SBI_EPAY_UNREACHABLE_BACKOFF` | Leave a payment alone this long after the gateway failed to answer about it | `120` |
 | `SBI_EPAY_PUSH_REPLAY_INTERVAL` | Seconds between retries of pushes that failed to process | `60` |
 | `SBI_EPAY_PUSH_MAX_ATTEMPTS` | Give up replaying a push after this many failures | `5` |
 | `SBI_EPAY_PUSH_MAX_BYTES` | Reject `pushRespData` larger than this | `16384` |

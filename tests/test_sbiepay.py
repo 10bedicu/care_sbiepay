@@ -8,7 +8,11 @@ from abdm.models import AbhaNumber, HealthFacility, PaymentOrder
 from abdm.models.payment_order import PaymentOrderStatus
 from abdm.service.helper import uuid
 from abdm.utils import user as abdm_user
+from care_sbiepay.locks import SbiEpayPaymentLock
+from care_sbiepay.models import SbiEpayMerchant, SbiEpayPayment, SbiEpayPushEvent
+from care_sbiepay.settings import plugin_settings as settings
 from care_sbiepay.utils import client, crypto
+from django.core.cache import cache
 from django.test import SimpleTestCase
 from model_bakery import baker
 
@@ -28,9 +32,6 @@ from care.utils.tests.base import CareAPITestBase
 from care.utils.time_util import care_now
 from care_sbiepay import payments, push_events, tasks
 from care_sbiepay import provider as sbiepay_provider
-from care_sbiepay.locks import SbiEpayPaymentLock
-from care_sbiepay.models import SbiEpayMerchant, SbiEpayPayment, SbiEpayPushEvent
-from care_sbiepay.settings import plugin_settings as settings
 
 MERCHANT_KEY = "/IIvvWMcy5ls/V2hCNZ5/Q=="
 
@@ -263,6 +264,19 @@ class TestSbiEpayProvider(SbiEpayTestBase):
             mock_create.call_args.kwargs["merch_order_no"], result["order_number"]
         )
         self.assertEqual(mock_create.call_args.args[0], self.merchant)
+
+    @patch("care_sbiepay.provider.client.create_payment_link")
+    def test_create_payment_link_expires_when_abdm_gives_up(self, mock_create):
+        mock_create.return_value = {"paymentUrl": "https://pay/abdm"}
+
+        with patch.object(
+            sbiepay_provider.abdm_settings, "ABDM_SCAN_AND_PAY_ORDER_MAX_AGE", 1800
+        ):
+            sbiepay_provider.SbiEpayProvider().create_payment_link(self.make_invoice())
+
+        validity = mock_create.call_args.kwargs["validity"]
+        expected = datetime.now(client.IST) + timedelta(seconds=1800)
+        self.assertAlmostEqual(validity, expected, delta=timedelta(seconds=5))
 
     def test_create_payment_link_requires_merchant(self):
         self.merchant.delete()
@@ -854,7 +868,25 @@ class TestSbiEpayStandalonePayment(SbiEpayTestBase):
 
         payment.refresh_from_db()
         self.assertEqual(payment.status, SbiEpayPayment.Status.CREATED)
+        # an unanswered payment is left alone for the backoff period
+        self.assertEqual(mock_status.call_count, 1)
+        self.assertTrue(cache.get(payments.backoff_key(payment)))
+
+        cache.delete(payments.backoff_key(payment))
+        payments.poll_pending_payments()
+
         self.assertEqual(mock_status.call_count, 2)
+
+    @patch("care_sbiepay.payments.client.status_query")
+    def test_poll_backs_off_only_when_gateway_did_not_answer(self, mock_status):
+        mock_status.return_value = {"Response Status": "NA"}
+        payment = self.make_payment("answered12345", "INV-ANSWERED")
+
+        payments.poll_pending_payments()
+        payments.poll_pending_payments()
+
+        self.assertEqual(mock_status.call_count, 2)
+        self.assertIsNone(cache.get(payments.backoff_key(payment)))
 
     @patch("care_sbiepay.payments.client.status_query")
     def test_poll_gives_up_after_hard_cap_and_flags_for_review(self, mock_status):
@@ -908,6 +940,16 @@ class TestSbiEpayStandalonePayment(SbiEpayTestBase):
             tasks.poll_pending_payments()
 
         mock_status.assert_not_called()
+
+    @patch("care_sbiepay.tasks.Lock")
+    def test_poll_task_does_nothing_when_nothing_is_pending(self, mock_lock):
+        self.make_payment(
+            "settled123456", "INV-SETTLED", status=SbiEpayPayment.Status.PAID
+        )
+
+        tasks.poll_pending_payments()
+
+        mock_lock.assert_not_called()
 
     @patch("care_sbiepay.payments.client.status_query")
     def test_poll_stops_at_order_validity(self, mock_status):

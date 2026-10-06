@@ -117,6 +117,8 @@ DEFAULTS = {
     "SBI_EPAY_CURRENCY": "INR",
     "SBI_EPAY_EXPIRY_GRACE_SECONDS": 900,
     "SBI_EPAY_EXPIRY_HARD_CAP_SECONDS": 86400,
+    # leave a payment alone this long after the gateway failed to answer about it
+    "SBI_EPAY_UNREACHABLE_BACKOFF": 120,
     "SBI_EPAY_PUSH_REPLAY_INTERVAL": 60,
     "SBI_EPAY_PUSH_MAX_ATTEMPTS": 5,
     "SBI_EPAY_PUSH_MAX_BYTES": 16384,

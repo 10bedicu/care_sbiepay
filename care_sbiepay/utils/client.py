@@ -100,10 +100,13 @@ def _source_url() -> str:
     return settings.SBI_EPAY_SOURCE_URL
 
 
-def order_validity() -> datetime:
+def order_validity(max_age: int | None = None) -> datetime:
+    """When the link stops being payable: ``max_age`` seconds from now, capped at
+    the end of the IST day (the only validity SBI has been seen to honour)."""
     now = datetime.now(IST)
     end_of_day = now.replace(hour=23, minute=59, second=59, microsecond=0)
-    return min(now + timedelta(seconds=settings.SBI_EPAY_PAYMENT_MAX_AGE), end_of_day)
+    seconds = settings.SBI_EPAY_PAYMENT_MAX_AGE if max_age is None else max_age
+    return min(now + timedelta(seconds=seconds), end_of_day)
 
 
 def get_token(force_refresh: bool = False) -> str:
