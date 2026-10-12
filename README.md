@@ -43,9 +43,9 @@ Settings are read from `PLUGIN_CONFIGS["care_sbiepay"]` or the environment:
 | `SBI_EPAY_SOURCE_URL` | Merchant's SBI-registered source URL | |
 | `SBI_EPAY_REQUEST_TIMEOUT` | HTTP request timeout in seconds | `30` |
 | `SBI_EPAY_PAID_RESPONSE_STATUSES` | Gateway statuses treated as paid | `SUCCESS` |
-| `SBI_EPAY_FAILED_RESPONSE_STATUSES` | Gateway statuses treated as failed | `FAILURE,FAILED,ABORTED,INVALID` |
-| `SBI_EPAY_CANCELLED_RESPONSE_STATUSES` | Gateway statuses treated as cancelled | `CANCELLED,CANCELED` |
-| `SBI_EPAY_EXPIRED_RESPONSE_STATUSES` | Gateway statuses treated as expired | `EXPIRED` |
+| `SBI_EPAY_FAILED_RESPONSE_STATUSES` | Gateway statuses treated as failed | `FAIL,FAILURE,FAILED,ABORTED,INVALID` |
+| `SBI_EPAY_CANCELLED_RESPONSE_STATUSES` | Gateway statuses treated as cancelled | `CANCEL,CANCELLED,CANCELED` |
+| `SBI_EPAY_EXPIRED_RESPONSE_STATUSES` | Gateway statuses treated as expired | `EXPIRE,EXPIRED` |
 | `SBI_EPAY_POLLING_ENABLED` | Enable the Celery status-polling task | `True` |
 | `SBI_EPAY_POLLING_INTERVAL` | Polling interval in seconds | `10` |
 | `SBI_EPAY_PAYMENT_MAX_AGE` | Seconds a new order stays payable (`merchOrderNoValidity`), capped at end of the IST day | `3600` |
