@@ -46,7 +46,7 @@ Settings are read from `PLUGIN_CONFIGS["care_sbiepay"]` or the environment:
 | `SBI_EPAY_FAILED_RESPONSE_STATUSES` | Gateway statuses treated as failed | `FAIL,FAILURE,FAILED,ABORTED,INVALID` |
 | `SBI_EPAY_CANCELLED_RESPONSE_STATUSES` | Gateway statuses treated as cancelled | `CANCEL,CANCELLED,CANCELED` |
 | `SBI_EPAY_EXPIRED_RESPONSE_STATUSES` | Gateway statuses treated as expired | `EXPIRE,EXPIRED` |
-| `SBI_EPAY_POLLING_ENABLED` | Enable the Celery status-polling task | `True` |
+| `SBI_EPAY_POLLING_ENABLED` | Enable the Celery status-polling task. Off unless set in the environment | `False` |
 | `SBI_EPAY_POLLING_INTERVAL` | Polling interval in seconds | `10` |
 | `SBI_EPAY_PAYMENT_MAX_AGE` | Seconds a new order stays payable (`merchOrderNoValidity`), capped at end of the IST day | `3600` |
 | `SBI_EPAY_CURRENCY` | Currency a confirmation must report; anything else is flagged for review | `INR` |
@@ -122,7 +122,7 @@ A standalone payment moves through these states:
   `replay_failed_push_events` task, and a push for an order CARE does not know
   is kept as `ignored`. Standalone orders settle their invoice; unknown orders
   fall through to ABDM scan-and-pay (when installed).
-- **Polling** — when `SBI_EPAY_POLLING_ENABLED` is on, a Celery task queries the
+- **Polling** — off unless `SBI_EPAY_POLLING_ENABLED` is set. When it is on, a Celery task queries the
   gateway every `SBI_EPAY_POLLING_INTERVAL` seconds for each pending payment and
   settles paid ones. Each payment stores the order validity sent to SBI as
   `expires_at`. Polling continues for `SBI_EPAY_EXPIRY_GRACE_SECONDS` past that,
