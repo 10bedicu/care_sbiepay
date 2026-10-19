@@ -440,11 +440,60 @@ class TestSbiEpayReconcile(SbiEpayTestBase):
         mock_task.assert_called_once()
 
     @patch("abdm.tasks.scan_pay.scan_pay_notify.delay")
-    def test_push_ignores_unpaid(self, mock_task):
+    def test_push_closes_failed_order(self, mock_task):
+        order = self.make_order()
+
+        with self.captureOnCommitCallbacks(execute=True):
+            handled = sbiepay_provider.reconcile_abdm_push(
+                {"merch_order_no": "sbiorder123", "status": "FAILED"}
+            )
+
+        self.assertTrue(handled)
+        order.refresh_from_db()
+        order.invoice.refresh_from_db()
+        self.assertEqual(order.status, PaymentOrderStatus.FAIL)
+        self.assertEqual(
+            order.invoice.status, InvoiceStatusOptions.entered_in_error.value
+        )
+        payload = mock_task.call_args.args[0]
+        self.assertEqual(payload["acknowledgement"]["status"], "FAIL")
+
+    @patch("abdm.tasks.scan_pay.scan_pay_notify.delay")
+    def test_push_closes_cancelled_order(self, mock_task):
+        order = self.make_order()
+
+        with self.captureOnCommitCallbacks(execute=True):
+            handled = sbiepay_provider.reconcile_abdm_push(
+                {"merch_order_no": "sbiorder123", "status": "CANCELLED"}
+            )
+
+        self.assertTrue(handled)
+        order.refresh_from_db()
+        self.assertEqual(order.status, PaymentOrderStatus.CANCELED)
+        payload = mock_task.call_args.args[0]
+        self.assertEqual(payload["acknowledgement"]["status"], "CANCELED")
+
+    @patch("abdm.tasks.scan_pay.scan_pay_notify.delay")
+    def test_push_closes_expired_order(self, mock_task):
+        order = self.make_order()
+
+        with self.captureOnCommitCallbacks(execute=True):
+            handled = sbiepay_provider.reconcile_abdm_push(
+                {"merch_order_no": "sbiorder123", "status": "EXPIRED"}
+            )
+
+        self.assertTrue(handled)
+        order.refresh_from_db()
+        self.assertEqual(order.status, PaymentOrderStatus.FAIL)
+        payload = mock_task.call_args.args[0]
+        self.assertEqual(payload["acknowledgement"]["status"], "FAIL")
+
+    @patch("abdm.tasks.scan_pay.scan_pay_notify.delay")
+    def test_push_ignores_non_terminal_status(self, mock_task):
         order = self.make_order()
 
         handled = sbiepay_provider.reconcile_abdm_push(
-            {"merch_order_no": "sbiorder123", "status": "FAILED"}
+            {"merch_order_no": "sbiorder123", "status": "PENDING"}
         )
 
         self.assertTrue(handled)

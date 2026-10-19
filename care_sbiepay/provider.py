@@ -9,7 +9,6 @@ from abdm.service.v3.payment_providers import (
     PaymentProvider,
     close_payment_order,
     create_payment_reconciliation,
-    reconcile_payment_order,
     register_provider,
 )
 from abdm.settings import plugin_settings as abdm_settings
@@ -28,21 +27,50 @@ from care_sbiepay.utils import client
 logger = logging.getLogger(__name__)
 
 
+def _scan_pay_order(order_number: str):
+    return (
+        PaymentOrder.objects.filter(order_number=order_number)
+        .select_related(
+            "invoice__account", "invoice__facility", "health_facility__facility"
+        )
+        .first()
+    )
+
+
+def apply_scan_pay_confirmation(order, confirmation) -> None:
+    """Apply a gateway confirmation to a scan-and-pay order.
+
+    A paid status records a reconciliation, and that signal notifies the PHR.
+    Cancelled, failed, and expired statuses close the order, which notifies
+    too. Any other status leaves the order payable.
+    """
+    status = confirmation.status
+    if status in paid_statuses():
+        create_payment_reconciliation(
+            order, confirmation.reference, amount=confirmation.amount
+        )
+    elif status in cancelled_statuses():
+        close_payment_order(order, PaymentOrderStatus.CANCELED)
+    elif status in failed_statuses() or status in expired_statuses():
+        close_payment_order(order, PaymentOrderStatus.FAIL)
+    else:
+        logger.info(
+            "SBI ePay order %s not paid, status %s", order.order_number, status
+        )
+
+
 def reconcile_abdm_push(push: dict) -> bool:
     """Reconcile an ABDM scan-and-pay order from a decoded push payload.
 
-    Only a paid status changes anything; a failed attempt does not close the
-    order because the link stays payable. Returns True when the order is known.
+    Paid, failed, cancelled, and expired statuses update the order and notify
+    the PHR. Returns True when the order is known.
     """
     confirmation = client.confirmation_from_push(push)
-    if confirmation.status in paid_statuses():
-        order = reconcile_payment_order(
-            confirmation.order_number,
-            confirmation.reference,
-            amount=confirmation.amount,
-        )
-        return order is not None
-    return PaymentOrder.objects.filter(order_number=confirmation.order_number).exists()
+    order = _scan_pay_order(confirmation.order_number)
+    if order is None:
+        return False
+    apply_scan_pay_confirmation(order, confirmation)
+    return True
 
 
 @register_provider
@@ -89,17 +117,5 @@ class SbiEpayProvider(PaymentProvider):
             amount=amount,
         )
         confirmation = client.confirmation_from_status(result, order.order_number)
-        status = confirmation.status
-        if status in paid_statuses():
-            create_payment_reconciliation(
-                order, confirmation.reference, amount=confirmation.amount
-            )
-        elif status in cancelled_statuses():
-            close_payment_order(order, PaymentOrderStatus.CANCELED)
-        elif status in failed_statuses() or status in expired_statuses():
-            close_payment_order(order, PaymentOrderStatus.FAIL)
-        else:
-            logger.info(
-                "SBI ePay order %s not paid, status %s", order.order_number, status
-            )
+        apply_scan_pay_confirmation(order, confirmation)
         return True
