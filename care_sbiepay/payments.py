@@ -285,18 +285,36 @@ def reconcile_payment(
     return True
 
 
-def _mark(payment: SbiEpayPayment, status: str, review: str = "") -> bool:
+def _remember_reference(payment: SbiEpayPayment, reference: str) -> None:
+    """Keep an ATRN on the payment when the gateway sent one."""
+    reference = (reference or "").strip()
+    if not reference or payment.reference == reference:
+        return
+    with SbiEpayPaymentLock(payment), transaction.atomic():
+        payment = _fresh(payment)
+        if payment.reference == reference:
+            return
+        payment.reference = reference
+        payment.save(update_fields=["reference", "modified_date"])
+
+
+def _mark(
+    payment: SbiEpayPayment, status: str, review: str = "", reference: str = ""
+) -> bool:
     """Move a still-pending payment to a terminal unpaid state."""
     with SbiEpayPaymentLock(payment), transaction.atomic():
         payment = _fresh(payment)
         if payment.status != SbiEpayPayment.Status.CREATED:
             return False
         payment.status = status
+        update_fields = ["status", "needs_review", "review_reason", "modified_date"]
+        reference = (reference or "").strip()
+        if reference:
+            payment.reference = reference
+            update_fields.append("reference")
         if review:
             payment.flag_for_review(review)
-        payment.save(
-            update_fields=["status", "needs_review", "review_reason", "modified_date"]
-        )
+        payment.save(update_fields=update_fields)
     return True
 
 
@@ -305,15 +323,17 @@ def apply_gateway_status(
 ) -> None:
     """Move a pending payment to a terminal state based on a gateway status."""
     status = confirmation.status
+    reference = confirmation.reference
     if status in paid_statuses():
         reconcile_payment(payment, confirmation)
     elif status in cancelled_statuses():
-        _mark(payment, SbiEpayPayment.Status.CANCELLED)
+        _mark(payment, SbiEpayPayment.Status.CANCELLED, reference=reference)
     elif status in failed_statuses():
-        _mark(payment, SbiEpayPayment.Status.FAILED)
+        _mark(payment, SbiEpayPayment.Status.FAILED, reference=reference)
     elif status in expired_statuses():
-        _mark(payment, SbiEpayPayment.Status.EXPIRED)
+        _mark(payment, SbiEpayPayment.Status.EXPIRED, reference=reference)
     else:
+        _remember_reference(payment, reference)
         logger.info(
             "SBI ePay order %s still pending, status %s",
             payment.order_number,

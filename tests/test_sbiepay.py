@@ -378,7 +378,10 @@ class TestSbiEpayReconcile(SbiEpayTestBase):
     @patch("abdm.tasks.scan_pay.scan_pay_notify.delay")
     @patch("care_sbiepay.provider.client.status_query")
     def test_reconcile_fails_failed_order(self, mock_status, mock_task):
-        mock_status.return_value = {"Response Status": "FAILURE"}
+        mock_status.return_value = {
+            "Response Status": "FAILURE",
+            "SBIePayRefID/ATRN": "ATRN-FAIL",
+        }
         order = self.make_order()
 
         with self.captureOnCommitCallbacks(execute=True):
@@ -386,9 +389,8 @@ class TestSbiEpayReconcile(SbiEpayTestBase):
 
         order.refresh_from_db()
         self.assertEqual(order.status, PaymentOrderStatus.FAIL)
-        self.assertEqual(
-            order.invoice.status, InvoiceStatusOptions.entered_in_error.value
-        )
+        self.assertEqual(order.transaction_id, "ATRN-FAIL")
+        self.assertEqual(order.invoice.status, InvoiceStatusOptions.cancelled.value)
         self.assertFalse(
             PaymentReconciliation.objects.filter(target_invoice=order.invoice).exists()
         )
@@ -445,18 +447,22 @@ class TestSbiEpayReconcile(SbiEpayTestBase):
 
         with self.captureOnCommitCallbacks(execute=True):
             handled = sbiepay_provider.reconcile_abdm_push(
-                {"merch_order_no": "sbiorder123", "status": "FAILED"}
+                {
+                    "merch_order_no": "sbiorder123",
+                    "status": "FAILED",
+                    "atrn": "ATRN-FAIL",
+                }
             )
 
         self.assertTrue(handled)
         order.refresh_from_db()
         order.invoice.refresh_from_db()
         self.assertEqual(order.status, PaymentOrderStatus.FAIL)
-        self.assertEqual(
-            order.invoice.status, InvoiceStatusOptions.entered_in_error.value
-        )
+        self.assertEqual(order.transaction_id, "ATRN-FAIL")
+        self.assertEqual(order.invoice.status, InvoiceStatusOptions.cancelled.value)
         payload = mock_task.call_args.args[0]
         self.assertEqual(payload["acknowledgement"]["status"], "FAIL")
+        self.assertEqual(payload["acknowledgement"]["transaction_id"], "ATRN-FAIL")
 
     @patch("abdm.tasks.scan_pay.scan_pay_notify.delay")
     def test_push_closes_cancelled_order(self, mock_task):
@@ -493,12 +499,13 @@ class TestSbiEpayReconcile(SbiEpayTestBase):
         order = self.make_order()
 
         handled = sbiepay_provider.reconcile_abdm_push(
-            {"merch_order_no": "sbiorder123", "status": "PENDING"}
+            {"merch_order_no": "sbiorder123", "status": "PENDING", "atrn": "ATRN-OPEN"}
         )
 
         self.assertTrue(handled)
         order.refresh_from_db()
         self.assertEqual(order.status, PaymentOrderStatus.PAYMENT_INITIATED)
+        self.assertEqual(order.transaction_id, "ATRN-OPEN")
         mock_task.assert_not_called()
 
     def test_push_for_unknown_order_is_not_handled(self):
@@ -523,7 +530,7 @@ class TestSbiEpayReconcile(SbiEpayTestBase):
         order.refresh_from_db()
         self.assertEqual(order.status, PaymentOrderStatus.SUCCESS)
         reconciliation = PaymentReconciliation.objects.get(target_invoice=order.invoice)
-        self.assertIn("voided", reconciliation.note)
+        self.assertIn("cancelled", reconciliation.note)
         mock_task.assert_called_once()
 
 
@@ -773,11 +780,16 @@ class TestSbiEpayStandalonePayment(SbiEpayTestBase):
         )
 
         payments.reconcile_push(
-            {"merch_order_no": "standalone789", "status": "FAILURE"}
+            {
+                "merch_order_no": "standalone789",
+                "status": "FAILURE",
+                "atrn": "ATRN-STANDALONE",
+            }
         )
 
         payment.refresh_from_db()
         self.assertEqual(payment.status, SbiEpayPayment.Status.FAILED)
+        self.assertEqual(payment.reference, "ATRN-STANDALONE")
         self.assertFalse(
             PaymentReconciliation.objects.filter(target_invoice=invoice).exists()
         )
