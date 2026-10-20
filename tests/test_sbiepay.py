@@ -404,7 +404,7 @@ class TestSbiEpayReconcile(SbiEpayTestBase):
         sbiepay_provider.SbiEpayProvider().reconcile_order(order)
 
         order.refresh_from_db()
-        self.assertEqual(order.status, PaymentOrderStatus.FAIL)
+        self.assertEqual(order.status, PaymentOrderStatus.EXPIRED)
 
     @patch("care_sbiepay.provider.client.status_query")
     def test_reconcile_cancels_cancelled_order(self, mock_status):
@@ -484,9 +484,9 @@ class TestSbiEpayReconcile(SbiEpayTestBase):
 
         self.assertTrue(handled)
         order.refresh_from_db()
-        self.assertEqual(order.status, PaymentOrderStatus.FAIL)
+        self.assertEqual(order.status, PaymentOrderStatus.EXPIRED)
         payload = mock_task.call_args.args[0]
-        self.assertEqual(payload["acknowledgement"]["status"], "FAIL")
+        self.assertEqual(payload["acknowledgement"]["status"], "EXPIRED")
 
     @patch("abdm.tasks.scan_pay.scan_pay_notify.delay")
     def test_push_ignores_non_terminal_status(self, mock_task):

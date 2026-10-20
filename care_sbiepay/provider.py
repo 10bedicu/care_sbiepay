@@ -51,7 +51,9 @@ def apply_scan_pay_confirmation(order, confirmation) -> None:
         )
     elif status in cancelled_statuses():
         close_payment_order(order, PaymentOrderStatus.CANCELED)
-    elif status in failed_statuses() or status in expired_statuses():
+    elif status in expired_statuses():
+        close_payment_order(order, PaymentOrderStatus.EXPIRED)
+    elif status in failed_statuses():
         close_payment_order(order, PaymentOrderStatus.FAIL)
     else:
         logger.info(
