@@ -21,6 +21,7 @@ from care.emr.models.payment_reconciliation import PaymentReconciliation
 from care.emr.resources.invoice.spec import InvoiceStatusOptions
 from care.emr.resources.payment_reconciliation.spec import (
     PaymentReconciliationOutcomeOptions,
+    PaymentReconciliationPaymentMethodOptions,
     PaymentReconciliationStatusOptions,
     PaymentReconciliationTypeOptions,
 )
@@ -151,6 +152,7 @@ class TestSbiEpayClient(SimpleTestCase):
                 "amount": "100.00",
                 "currency": "inr",
                 "merchant_id": "1000755",
+                "pay_mode": "NB",
             }
         )
 
@@ -159,6 +161,7 @@ class TestSbiEpayClient(SimpleTestCase):
         self.assertEqual(confirmation.amount, Decimal("100.00"))
         self.assertEqual(confirmation.currency, "INR")
         self.assertEqual(confirmation.merchant_code, "1000755")
+        self.assertEqual(confirmation.pay_mode, "NB")
 
     def test_confirmation_tolerates_missing_or_bad_amount(self):
         self.assertIsNone(client.confirmation_from_push({"amount": "abc"}).amount)
@@ -166,6 +169,25 @@ class TestSbiEpayClient(SimpleTestCase):
             client.confirmation_from_status({"Response Status": "PENDING"}, "o1").amount
         )
         self.assertEqual(client.confirmation_from_status({}, "o1").order_number, "o1")
+        self.assertEqual(
+            client.confirmation_from_status({"Pay Mode": "CC"}, "o1").pay_mode, "CC"
+        )
+
+    def test_reconciliation_method_keeps_exact_modes(self):
+        method = PaymentReconciliationPaymentMethodOptions
+        self.assertEqual(payments.reconciliation_method("CC"), method.ccca.value)
+        self.assertEqual(
+            payments.reconciliation_method("Debit Card"), method.debc.value
+        )
+        self.assertEqual(payments.reconciliation_method("cash"), method.cash.value)
+
+    def test_reconciliation_method_defaults_when_mode_is_not_exact(self):
+        direct_deposit = PaymentReconciliationPaymentMethodOptions.ddpo.value
+        self.assertEqual(payments.reconciliation_method("NB"), direct_deposit)
+        self.assertEqual(payments.reconciliation_method("UPI"), direct_deposit)
+        self.assertEqual(payments.reconciliation_method("Net Banking"), direct_deposit)
+        self.assertEqual(payments.reconciliation_method(""), direct_deposit)
+        self.assertEqual(payments.reconciliation_method(None), direct_deposit)
 
 
 class SbiEpayTestBase(CareAPITestBase):
@@ -303,8 +325,46 @@ class TestSbiEpayReconcile(SbiEpayTestBase):
         self.assertEqual(order.transaction_id, "ATRN123")
         reconciliation = PaymentReconciliation.objects.get(target_invoice=order.invoice)
         self.assertEqual(reconciliation.amount, Decimal(100))
+        self.assertEqual(
+            reconciliation.method,
+            PaymentReconciliationPaymentMethodOptions.ddpo.value,
+        )
         mock_task.assert_called_once()
         self.assertEqual(mock_status.call_args.args[0], self.merchant)
+
+    @patch("abdm.tasks.scan_pay.scan_pay_notify.delay")
+    @patch("care_sbiepay.provider.client.status_query")
+    def test_reconcile_stores_credit_card_when_gateway_says_so(
+        self, mock_status, _task
+    ):
+        mock_status.return_value = {
+            "Response Status": "SUCCESS",
+            "SBIePayRefID/ATRN": "ATRN123",
+            "Pay Mode": "CC",
+        }
+        order = self.make_order()
+
+        sbiepay_provider.SbiEpayProvider().reconcile_order(order)
+
+        reconciliation = PaymentReconciliation.objects.get(target_invoice=order.invoice)
+        self.assertEqual(
+            reconciliation.method,
+            PaymentReconciliationPaymentMethodOptions.ccca.value,
+        )
+
+    @patch("abdm.tasks.scan_pay.scan_pay_notify.delay")
+    def test_push_stores_netbanking_as_direct_deposit(self, _task):
+        order = self.make_order()
+
+        sbiepay_provider.reconcile_abdm_push(
+            self.success_push("sbiorder123", pay_mode="NB")
+        )
+
+        reconciliation = PaymentReconciliation.objects.get(target_invoice=order.invoice)
+        self.assertEqual(
+            reconciliation.method,
+            PaymentReconciliationPaymentMethodOptions.ddpo.value,
+        )
 
     @patch("abdm.tasks.scan_pay.scan_pay_notify.delay")
     @patch("care_sbiepay.provider.client.status_query")
@@ -631,7 +691,24 @@ class TestSbiEpayStandalonePayment(SbiEpayTestBase):
         self.assertEqual(payment.reconciliation, reconciliation)
         self.assertEqual(reconciliation.amount, Decimal("100.00"))
         self.assertEqual(reconciliation.reference_number, "ATRN555")
+        self.assertEqual(
+            reconciliation.method,
+            PaymentReconciliationPaymentMethodOptions.ddpo.value,
+        )
         mock_rebalance.assert_called_once_with(self.account.id)
+
+    def test_push_stores_debit_card_when_gateway_says_so(self):
+        payment = self.make_payment("debitmode1234", "INV-DC")
+
+        payments.reconcile_push(self.success_push("debitmode1234", pay_mode="DC"))
+
+        reconciliation = PaymentReconciliation.objects.get(
+            target_invoice=payment.invoice
+        )
+        self.assertEqual(
+            reconciliation.method,
+            PaymentReconciliationPaymentMethodOptions.debc.value,
+        )
 
     @patch("care_sbiepay.payments.rebalance_account_task.delay")
     def test_rebalance_waits_for_commit(self, mock_rebalance):

@@ -68,6 +68,37 @@ def polling_deadline(payment: SbiEpayPayment):
     return deadline + timedelta(seconds=settings.SBI_EPAY_EXPIRY_GRACE_SECONDS)
 
 
+# SBI's pay mode is a short code (CC, DC, NB, UPI, …), not one of our method
+# values. Only a code that names a method we store is kept; net banking, UPI,
+# and a missing mode are recorded as a direct deposit.
+_PAY_MODE_METHODS = {
+    "cc": PaymentReconciliationPaymentMethodOptions.ccca.value,
+    "ccca": PaymentReconciliationPaymentMethodOptions.ccca.value,
+    "creditcard": PaymentReconciliationPaymentMethodOptions.ccca.value,
+    "dc": PaymentReconciliationPaymentMethodOptions.debc.value,
+    "debc": PaymentReconciliationPaymentMethodOptions.debc.value,
+    "debitcard": PaymentReconciliationPaymentMethodOptions.debc.value,
+    "cash": PaymentReconciliationPaymentMethodOptions.cash.value,
+    "chck": PaymentReconciliationPaymentMethodOptions.chck.value,
+    "cheque": PaymentReconciliationPaymentMethodOptions.chck.value,
+    "check": PaymentReconciliationPaymentMethodOptions.chck.value,
+    "ddpo": PaymentReconciliationPaymentMethodOptions.ddpo.value,
+    "directdeposit": PaymentReconciliationPaymentMethodOptions.ddpo.value,
+    "cchk": PaymentReconciliationPaymentMethodOptions.cchk.value,
+    "creditcheck": PaymentReconciliationPaymentMethodOptions.cchk.value,
+    "cdac": PaymentReconciliationPaymentMethodOptions.cdac.value,
+    "creditaccount": PaymentReconciliationPaymentMethodOptions.cdac.value,
+}
+
+
+def reconciliation_method(pay_mode: str | None) -> str:
+    """Payment method to store for an SBI pay-mode code."""
+    key = re.sub(r"[^a-z0-9]", "", (pay_mode or "").lower())
+    return _PAY_MODE_METHODS.get(
+        key, PaymentReconciliationPaymentMethodOptions.ddpo.value
+    )
+
+
 def other_details(invoice) -> str:
     return re.sub(r"[^A-Za-z0-9]", "", invoice.patient.name or "")[:100] or "CARE"
 
@@ -210,7 +241,7 @@ def _validate(
 
 
 def _record_reconciliation(
-    payment: SbiEpayPayment, reference: str, amount: Decimal, note: str
+    payment: SbiEpayPayment, reference: str, amount: Decimal, note: str, method: str
 ) -> PaymentReconciliation:
     invoice = payment.invoice
     return PaymentReconciliation.objects.create(
@@ -222,7 +253,7 @@ def _record_reconciliation(
         kind=PaymentReconciliationKindOptions.online.value,
         issuer_type=PaymentReconciliationIssuerTypeOptions.patient.value,
         outcome=PaymentReconciliationOutcomeOptions.complete.value,
-        method=PaymentReconciliationPaymentMethodOptions.debc.value,
+        method=method,
         payment_datetime=care_now(),
         amount=amount,
         tendered_amount=amount,
@@ -256,7 +287,11 @@ def reconcile_payment(
         if reasons:
             note += " Needs review: " + "; ".join(reasons) + "."
         payment.reconciliation = _record_reconciliation(
-            payment, reference, amount, note
+            payment,
+            reference,
+            amount,
+            note,
+            reconciliation_method(confirmation.pay_mode),
         )
         payment.paid_amount = amount
         payment.reference = reference

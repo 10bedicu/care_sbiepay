@@ -22,6 +22,7 @@ from care_sbiepay.payments import (
     merchant_for,
     other_details,
     paid_statuses,
+    reconciliation_method,
 )
 from care_sbiepay.utils import client
 
@@ -48,7 +49,12 @@ def apply_scan_pay_confirmation(order, confirmation) -> None:
     status = confirmation.status
     reference = confirmation.reference
     if status in paid_statuses():
-        create_payment_reconciliation(order, reference, amount=confirmation.amount)
+        create_payment_reconciliation(
+            order,
+            reference,
+            amount=confirmation.amount,
+            method=reconciliation_method(confirmation.pay_mode),
+        )
     elif status in cancelled_statuses():
         close_payment_order(order, PaymentOrderStatus.CANCELED, reference=reference)
     elif status in expired_statuses():

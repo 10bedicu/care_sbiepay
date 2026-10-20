@@ -38,6 +38,7 @@ class Confirmation:
     amount: Decimal | None = None
     currency: str = ""
     merchant_code: str = ""
+    pay_mode: str = ""
     raw: dict = field(default_factory=dict)
 
 
@@ -66,6 +67,7 @@ def confirmation_from_push(push: dict) -> Confirmation:
         amount=_decimal_or_none(push.get("amount")),
         currency=_first(push, "currency").upper(),
         merchant_code=_first(push, "merchant_id"),
+        pay_mode=_first(push, "pay_mode", "Pay Mode", "payMode"),
         raw=push,
     )
 
@@ -79,6 +81,9 @@ def confirmation_from_status(result: dict, order_number: str) -> Confirmation:
         amount=_decimal_or_none(_first(result, "Amount", "amount") or None),
         currency=_first(result, "Currency", "currency").upper(),
         merchant_code=_first(result, "Merchant ID", "merchantId"),
+        pay_mode=_first(
+            result, "Pay Mode", "pay_mode", "payMode", "Payment Mode", "paymentMode"
+        ),
         raw=result,
     )
 
